@@ -3,24 +3,55 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import simpleGit from 'simple-git';
-import { readFile, writeFile } from 'fs/promises';
-import { join } from 'path';
+import { BulkCommitScanner } from './scanner';
+import { GitBlameIgnoreFileManager } from './file-manager';
 
 const program = new Command();
 
 program
   .name('git-blame-ignore')
   .description('Auto-detects bulk-change commits and manages .git-blame-ignore-revs file')
-  .version('1.0.0');
+  .version('1.1.0');
 
 program
   .command('scan')
   .description('Scan repository for bulk-change commits')
-  .option('-n, --number <number>', 'Number of commits to check (default: 50)', '50')
-  .option('-t, --threshold <threshold>', 'Threshold for bulk changes (default: 10)', '10')
+  .option('-n, --number <count>', 'Number of commits to scan', '100')
+  .option('-s, --min-score <score>', 'Minimum bulk score to report (0-100)', '40')
+  .option('-f, --min-files <count>', 'Minimum files changed to consider', '20')
+  .option('--json', 'Output as JSON')
   .action(async (options) => {
     try {
-      await scanBulkCommits(parseInt(options.number), parseInt(options.threshold));
+      const git = simpleGit();
+      await git.revparse(['--is-inside-work-tree']);
+
+      const scanner = new BulkCommitScanner(process.cwd(), {
+        minFilesChanged: parseInt(options.minFiles),
+        minBulkScore: parseInt(options.minScore),
+      });
+
+      const results = await scanner.scan(parseInt(options.number));
+
+      if (options.json) {
+        console.log(JSON.stringify(results, null, 2));
+        return;
+      }
+
+      if (results.length === 0) {
+        console.log(chalk.green('✅ No bulk-change commits found'));
+        return;
+      }
+
+      console.log(chalk.blue(`\n🔍 Found ${results.length} bulk-change commit(s):\n`));
+
+      for (const commit of results) {
+        console.log(chalk.white(`  ${commit.sha.substring(0, 7)}`) + chalk.gray(` [${commit.bulkScore}/100]`) + ` ${commit.message}`);
+        console.log(chalk.gray(`     📁 ${commit.filesChanged} files, 📝 ${commit.linesChanged} lines, ⬜ ${Math.round(commit.whitespaceRatio * 100)}% whitespace`));
+        console.log(chalk.gray(`     📅 ${commit.date}`));
+        console.log();
+      }
+
+      console.log(chalk.blue(`Tip: Run ${chalk.cyan('git-blame-ignore ignore --auto')} to add them all, or ${chalk.cyan('git-blame-ignore ignore --commits <sha>')} for specific ones`));
     } catch (error) {
       console.error(chalk.red('Error:'), (error as Error).message);
       process.exit(1);
@@ -30,21 +61,38 @@ program
 program
   .command('ignore')
   .description('Add bulk-change commits to .git-blame-ignore-revs')
-  .option('-c, --commits <commits>', 'Comma-separated list of commit hashes to ignore')
+  .option('-c, --commits <shas>', 'Comma-separated list of commit hashes to ignore')
   .option('-a, --auto', 'Auto-scan and add all detected bulk commits')
+  .option('-m, --message <msg>', 'Comment to add alongside the entries')
   .action(async (options) => {
     try {
+      const manager = new GitBlameIgnoreFileManager();
+
       if (options.auto) {
-        const bulkCommits = await scanBulkCommits(50, 10);
-        if (bulkCommits.length > 0) {
-          await addToIgnoreFile(bulkCommits.map(commit => commit.hash));
+        const scanner = new BulkCommitScanner(process.cwd());
+        const results = await scanner.scan();
+
+        if (results.length === 0) {
+          console.log(chalk.yellow('No bulk-change commits detected. Nothing to add.'));
+          return;
         }
+
+        console.log(chalk.blue(`Adding ${results.length} bulk-change commit(s)...`));
+        for (const commit of results) {
+          await manager.add(commit.sha, options.message);
+        }
+        console.log(chalk.green(`\n✅ Added ${results.length} commits to .git-blame-ignore-revs`));
       } else if (options.commits) {
-        const commitHashes = options.commits.split(',').map((hash: string) => hash.trim());
-        await addToIgnoreFile(commitHashes);
+        const shas = options.commits.split(',').map((s: string) => s.trim()).filter(Boolean);
+        for (const sha of shas) {
+          await manager.add(sha, options.message);
+        }
       } else {
-        console.log(chalk.yellow('Please specify either --commits or --auto'));
+        console.log(chalk.yellow('Specify --commits <shas> or --auto'));
       }
+
+      console.log(chalk.blue('\n💡 Configure git to use it:'));
+      console.log(chalk.gray('   git config blame.ignoreRevsFile .git-blame-ignore-revs'));
     } catch (error) {
       console.error(chalk.red('Error:'), (error as Error).message);
       process.exit(1);
@@ -54,9 +102,32 @@ program
 program
   .command('list')
   .description('List commits currently ignored in .git-blame-ignore-revs')
-  .action(async () => {
+  .option('--json', 'Output as JSON')
+  .action(async (options) => {
     try {
-      await listIgnoredCommits();
+      const manager = new GitBlameIgnoreFileManager();
+
+      if (options.json) {
+        const entries = await manager.read();
+        console.log(JSON.stringify(entries, null, 2));
+        return;
+      }
+
+      const entries = await manager.read();
+
+      if (entries.length === 0) {
+        console.log(chalk.yellow('No commits are currently ignored'));
+        return;
+      }
+
+      console.log(chalk.blue(`\n📝 ${entries.length} ignored commit(s):\n`));
+
+      for (const [i, entry] of entries.entries()) {
+        console.log(chalk.white(`  ${i + 1}. ${entry.sha.substring(0, 7)}`) + ` ${entry.message}`);
+        console.log(chalk.gray(`     ${entry.date}${entry.comment ? ` — ${entry.comment}` : ''}`));
+      }
+
+      console.log();
     } catch (error) {
       console.error(chalk.red('Error:'), (error as Error).message);
       process.exit(1);
@@ -66,17 +137,23 @@ program
 program
   .command('remove')
   .description('Remove commits from .git-blame-ignore-revs')
-  .option('-c, --commits <commits>', 'Comma-separated list of commit hashes to remove')
+  .option('-c, --commits <shas>', 'Comma-separated list of commit hashes to remove')
   .option('-a, --all', 'Remove all ignored commits')
   .action(async (options) => {
     try {
+      const manager = new GitBlameIgnoreFileManager();
+
       if (options.all) {
-        await removeAllIgnoredCommits();
+        const count = await manager.removeAll();
+        console.log(chalk.green(`✅ Removed all ${count} ignored commits`));
+        console.log(chalk.blue('💡 Backup saved to .git-blame-ignore-revs.backup'));
       } else if (options.commits) {
-        const commitHashes = options.commits.split(',').map((hash: string) => hash.trim());
-        await removeFromIgnoreFile(commitHashes);
+        const shas = options.commits.split(',').map((s: string) => s.trim()).filter(Boolean);
+        for (const sha of shas) {
+          await manager.remove(sha);
+        }
       } else {
-        console.log(chalk.yellow('Please specify either --commits or --all'));
+        console.log(chalk.yellow('Specify --commits <shas> or --all'));
       }
     } catch (error) {
       console.error(chalk.red('Error:'), (error as Error).message);
@@ -84,158 +161,36 @@ program
     }
   });
 
-async function scanBulkCommits(limit: number, threshold: number) {
-  const git = simpleGit();
-  
-  // Check if we're in a git repository
-  try {
-    await git.revparse(['--is-inside-work-tree']);
-  } catch (error) {
-    throw new Error('Not a git repository');
-  }
-
-  console.log(chalk.blue(`Scanning last ${limit} commits for bulk changes...`));
-
-  const logOutput = await git.log(['--pretty=format:%H %s %an %ad', `--max-count=${limit}`, '--date=short']);
-  const commits = logOutput.all;
-
-  const bulkCommits: Array<{ hash: string; subject: string; author: string; date: string; changes: number }> = [];
-
-  for (const commit of commits) {
+program
+  .command('validate')
+  .description('Validate entries in .git-blame-ignore-revs')
+  .option('--json', 'Output as JSON')
+  .action(async (options) => {
     try {
-      // Get number of changed files in this commit
-      const diffSummary = await git.diffSummary([`${commit.hash}^`, commit.hash]);
-      const changesCount = diffSummary.files.length;
+      const manager = new GitBlameIgnoreFileManager();
+      const { valid, invalid } = await manager.validate();
 
-      if (changesCount >= threshold) {
-        bulkCommits.push({
-          hash: commit.hash,
-          subject: commit.message.split('\n')[0],
-          author: commit.author_name,
-          date: commit.date,
-          changes: changesCount
-        });
+      if (options.json) {
+        console.log(JSON.stringify({ valid, invalid }, null, 2));
+        return;
+      }
+
+      if (valid.length === 0 && invalid.length === 0) {
+        console.log(chalk.yellow('No entries to validate'));
+        return;
+      }
+
+      console.log(chalk.green(`✅ ${valid.length} valid entries`));
+      if (invalid.length > 0) {
+        console.log(chalk.red(`❌ ${invalid.length} invalid entries:`));
+        for (const sha of invalid) {
+          console.log(chalk.red(`   ${sha}`));
+        }
       }
     } catch (error) {
-      console.warn(chalk.yellow(`Warning: Could not analyze commit ${commit.hash}: ${(error as Error).message}`));
+      console.error(chalk.red('Error:'), (error as Error).message);
+      process.exit(1);
     }
-  }
-
-  if (bulkCommits.length === 0) {
-    console.log(chalk.green('✅ No bulk-change commits found'));
-    return [];
-  }
-
-  console.log(chalk.blue('\n🔍 Bulk-change commits detected:'));
-  console.table(bulkCommits.map(commit => ({
-    Hash: commit.hash.substring(0, 8),
-    Subject: commit.subject,
-    Author: commit.author,
-    Date: commit.date,
-    Changes: commit.changes
-  })));
-
-  return bulkCommits;
-}
-
-async function addToIgnoreFile(commitHashes: string[]) {
-  const gitignorePath = join(process.cwd(), '.git-blame-ignore-revs');
-  let existingContent = '';
-
-  try {
-    existingContent = await readFile(gitignorePath, 'utf-8');
-  } catch (error) {
-    // File doesn't exist, that's okay
-  }
-
-  const newCommits = commitHashes.filter(hash => !existingContent.includes(hash));
-  
-  if (newCommits.length === 0) {
-    console.log(chalk.green('✅ All specified commits are already ignored'));
-    return;
-  }
-
-  const updatedContent = existingContent + (existingContent ? '\n' : '') + newCommits.join('\n') + '\n';
-  
-  try {
-    await writeFile(gitignorePath, updatedContent, 'utf-8');
-    console.log(chalk.green(`✅ Added ${newCommits.length} commit(s) to .git-blame-ignore-revs`));
-    console.log(chalk.blue('💡 Run `git blame --ignore-revs` to use the ignore file'));
-  } catch (error) {
-    throw new Error(`Failed to write .git-blame-ignore-revs: ${(error as Error).message}`);
-  }
-}
-
-async function listIgnoredCommits() {
-  const gitignorePath = join(process.cwd(), '.git-blame-ignore-revs');
-  
-  try {
-    const content = await readFile(gitignorePath, 'utf-8');
-    const commits = content.split('\n').filter(line => line.trim() && !line.startsWith('#'));
-    
-    if (commits.length === 0) {
-      console.log(chalk.yellow('No commits are currently ignored'));
-      return;
-    }
-
-    console.log(chalk.blue('📝 Currently ignored commits:'));
-    commits.forEach((commit, index) => {
-      console.log(`${index + 1}. ${commit}`);
-    });
-  } catch (error) {
-    throw new Error('.git-blame-ignore-revs file not found');
-  }
-}
-
-async function removeFromIgnoreFile(commitHashes: string[]) {
-  const gitignorePath = join(process.cwd(), '.git-blame-ignore-revs');
-  
-  try {
-    const content = await readFile(gitignorePath, 'utf-8');
-    const lines = content.split('\n');
-    
-    const filteredLines = lines.filter(line => {
-      return !commitHashes.includes(line.trim());
-    });
-    
-    const updatedContent = filteredLines.join('\n');
-    
-    if (updatedContent === content) {
-      console.log(chalk.yellow('None of the specified commits are currently ignored'));
-      return;
-    }
-    
-    await writeFile(gitignorePath, updatedContent, 'utf-8');
-    console.log(chalk.green(`✅ Removed ${commitHashes.length} commit(s) from .git-blame-ignore-revs`));
-  } catch (error) {
-    throw new Error('.git-blame-ignore-revs file not found');
-  }
-}
-
-async function removeAllIgnoredCommits() {
-  const gitignorePath = join(process.cwd(), '.git-blame-ignore-revs');
-  
-  try {
-    const content = await readFile(gitignorePath, 'utf-8');
-    const commits = content.split('\n').filter(line => line.trim() && !line.startsWith('#'));
-    
-    if (commits.length === 0) {
-      console.log(chalk.yellow('No commits are currently ignored'));
-      return;
-    }
-    
-    // Create a backup
-    const backupPath = gitignorePath + '.backup';
-    await writeFile(backupPath, content, 'utf-8');
-    
-    // Clear the file but keep the structure
-    await writeFile(gitignorePath, '# Git blame ignore file - auto-generated by git-blame-ignore\n', 'utf-8');
-    
-    console.log(chalk.green(`✅ Removed all ${commits.length} ignored commits`));
-    console.log(chalk.blue(`💡 Backup saved to: ${backupPath}`));
-  } catch (error) {
-    throw new Error('.git-blame-ignore-revs file not found');
-  }
-}
+  });
 
 program.parse();

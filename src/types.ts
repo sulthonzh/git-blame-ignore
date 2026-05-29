@@ -21,3 +21,13 @@ export interface GitBlameIgnoreConfig {
   minBulkScore: number;
   whitespaceThreshold: number;
 }
+
+export interface ScanResult {
+  bulkCommits: BulkCommit[];
+  totalScanned: number;
+}
+
+export interface ValidateResult {
+  valid: IgnoreEntry[];
+  invalid: string[];
+}

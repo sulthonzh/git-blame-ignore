@@ -1,17 +1,26 @@
 import fs from 'fs/promises';
 import path from 'path';
+import simpleGit from 'simple-git';
 import { IgnoreEntry } from './types';
 
 export class GitBlameIgnoreFileManager {
   private ignoreFilePath: string;
+  private baseDir: string;
 
-  constructor(ignoreFilePath?: string) {
+  constructor(ignoreFilePath?: string, baseDir?: string) {
+    this.baseDir = baseDir || process.cwd();
     this.ignoreFilePath = ignoreFilePath || '.git-blame-ignore-revs';
+  }
+
+  get fullPath(): string {
+    return path.isAbsolute(this.ignoreFilePath)
+      ? this.ignoreFilePath
+      : path.join(this.baseDir, this.ignoreFilePath);
   }
 
   async exists(): Promise<boolean> {
     try {
-      await fs.access(this.ignoreFilePath);
+      await fs.access(this.fullPath);
       return true;
     } catch {
       return false;
@@ -23,128 +32,192 @@ export class GitBlameIgnoreFileManager {
       return [];
     }
 
-    try {
-      const content = await fs.readFile(this.ignoreFilePath, 'utf-8');
-      const entries: IgnoreEntry[] = [];
-      
-      const lines = content.split('\n').filter(line => line.trim() && !line.trim().startsWith('#'));
-      
-      for (const line of lines) {
-        const sha = line.trim();
-        if (sha && /^[a-f0-9]{40}$/i.test(sha)) {
-          const entry = await this.createIgnoreEntry(sha);
-          if (entry) {
-            entries.push(entry);
-          }
-        }
+    const content = await fs.readFile(this.fullPath, 'utf-8');
+    const entries: IgnoreEntry[] = [];
+
+    const lines = content.split('\n');
+    let lastComment: string | undefined;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      if (trimmed.startsWith('#') && trimmed.length > 1) {
+        // Track comments that describe entries
+        lastComment = trimmed.substring(1).trim();
+        continue;
       }
 
-      return entries;
-    } catch (error) {
-      throw new Error(`Failed to read ${this.ignoreFilePath}: ${error}`);
+      if (trimmed && /^[a-f0-9]{7,40}$/i.test(trimmed)) {
+        const entry = await this.createIgnoreEntry(trimmed);
+        if (entry) {
+          entries.push(lastComment ? { ...entry, comment: lastComment } : entry);
+          lastComment = undefined;
+        }
+      }
     }
+
+    return entries;
+  }
+
+  async readRaw(): Promise<string[]> {
+    if (!(await this.exists())) {
+      return [];
+    }
+
+    const content = await fs.readFile(this.fullPath, 'utf-8');
+    return content.split('\n').filter(line => {
+      const trimmed = line.trim();
+      return trimmed && !trimmed.startsWith('#');
+    });
   }
 
   async add(sha: string, comment?: string): Promise<void> {
-    const entry = await this.createIgnoreEntry(sha);
-    if (!entry) {
-      throw new Error(`Invalid commit SHA: ${sha}`);
+    // Resolve short SHA to full SHA
+    const fullSha = await this.resolveSha(sha);
+    if (!fullSha) {
+      throw new Error(`Invalid or unknown commit SHA: ${sha}`);
     }
 
-    const entries = await this.read();
-    
-    // Check if already exists
-    if (entries.some(e => e.sha === sha)) {
+    const existing = await this.readRaw();
+    if (existing.some(e => e === fullSha || fullSha.startsWith(e) || e.startsWith(fullSha))) {
       console.log(`Entry ${sha.substring(0, 7)} already exists in ${this.ignoreFilePath}`);
       return;
     }
 
-    entries.push({
-      ...entry,
-      comment: comment || `Auto-added by git-blame-ignore`
-    });
+    const message = await this.getCommitMessage(fullSha);
+    const date = await this.getCommitDate(fullSha);
+    const entryComment = comment || `Auto-added by git-blame-ignore`;
 
-    await this.write(entries);
-    console.log(`Added ${sha.substring(0, 7)} to ${this.ignoreFilePath}`);
+    const header = '# .git-blame-ignore-revs - managed by git-blame-ignore\n# Format: SHA of commits to ignore for git blame\n\n';
+    const entryBlock = `# ${fullSha.substring(0, 7)} - ${message} (${date}) - ${entryComment}\n${fullSha}\n`;
+
+    let content: string;
+    if (await this.exists()) {
+      content = await fs.readFile(this.fullPath, 'utf-8');
+      // Remove old header if it's the only content
+      if (content.trim() === header.trim()) {
+        content = header + entryBlock;
+      } else {
+        content = content.trimEnd() + '\n\n' + entryBlock;
+      }
+    } else {
+      content = header + entryBlock;
+    }
+
+    await fs.mkdir(path.dirname(this.fullPath), { recursive: true });
+    await fs.writeFile(this.fullPath, content);
+    console.log(`Added ${fullSha.substring(0, 7)} (${message}) to ${this.ignoreFilePath}`);
   }
 
   async remove(sha: string): Promise<void> {
-    const entries = await this.read();
-    const filtered = entries.filter(e => e.sha !== sha);
-    
-    if (filtered.length === entries.length) {
+    if (!(await this.exists())) {
+      throw new Error(`${this.ignoreFilePath} not found`);
+    }
+
+    const content = await fs.readFile(this.fullPath, 'utf-8');
+    const lines = content.split('\n');
+    const shaTrimmed = sha.trim();
+    let removed = false;
+
+    const filtered = lines.filter(line => {
+      const trimmed = line.trim();
+      if (trimmed === shaTrimmed || (trimmed.match(/^[a-f0-9]+$/i) && (trimmed.startsWith(shaTrimmed) || shaTrimmed.startsWith(trimmed)))) {
+        removed = true;
+        return false;
+      }
+      return true;
+    });
+
+    if (!removed) {
       console.log(`Entry ${sha.substring(0, 7)} not found in ${this.ignoreFilePath}`);
       return;
     }
 
-    await this.write(filtered);
+    await fs.writeFile(this.fullPath, filtered.join('\n'));
     console.log(`Removed ${sha.substring(0, 7)} from ${this.ignoreFilePath}`);
   }
 
-  async write(entries: IgnoreEntry[]): Promise<void> {
-    try {
-      // Create directory if it doesn't exist
-      const dir = path.dirname(this.ignoreFilePath);
-      await fs.mkdir(dir, { recursive: true });
-
-      let content = '# .git-blame-ignore-revs - managed by git-blame-ignore\n';
-      content += '# Format: SHA of commits to ignore for git blame\n\n';
-
-      for (const entry of entries) {
-        content += `# ${entry.sha.substring(0, 7)} - ${entry.message} (${entry.date})\n`;
-        content += `${entry.sha}\n\n`;
-      }
-
-      await fs.writeFile(this.ignoreFilePath, content);
-    } catch (error) {
-      throw new Error(`Failed to write ${this.ignoreFilePath}: ${error}`);
+  async removeAll(): Promise<number> {
+    if (!(await this.exists())) {
+      throw new Error(`${this.ignoreFilePath} not found`);
     }
+
+    const content = await fs.readFile(this.fullPath, 'utf-8');
+    const commits = content.split('\n').filter(line => line.trim() && !line.trim().startsWith('#'));
+
+    // Backup
+    const backupPath = this.fullPath + '.backup';
+    await fs.writeFile(backupPath, content);
+
+    await fs.writeFile(
+      this.fullPath,
+      '# .git-blame-ignore-revs - managed by git-blame-ignore\n# (cleared)\n'
+    );
+
+    return commits.length;
   }
 
-  async validate(entries: IgnoreEntry[]): Promise<{ valid: IgnoreEntry[]; invalid: IgnoreEntry[] }> {
+  async validate(): Promise<{ valid: IgnoreEntry[]; invalid: string[] }> {
+    const raw = await this.readRaw();
     const valid: IgnoreEntry[] = [];
-    const invalid: IgnoreEntry[] = [];
+    const invalid: string[] = [];
 
-    for (const entry of entries) {
-      try {
-        // Check if SHA is a valid 40-character hex string
-        if (!/^[a-f0-9]{40}$/i.test(entry.sha)) {
-          invalid.push(entry);
-          continue;
-        }
-
-        // Try to get commit info to verify it exists
-        const git = require('simple-git')();
-        const result = await git.show([entry.sha, '--format=%H', '--no-patch']);
-        
-        if (result.trim() === entry.sha) {
-          valid.push(entry);
-        } else {
-          invalid.push(entry);
-        }
-      } catch {
-        invalid.push(entry);
+    for (const sha of raw) {
+      const entry = await this.createIgnoreEntry(sha);
+      if (entry) {
+        valid.push(entry);
+      } else {
+        invalid.push(sha);
       }
     }
 
     return { valid, invalid };
   }
 
-  private async createIgnoreEntry(sha: string): Promise<IgnoreEntry | null> {
+  private async resolveSha(sha: string): Promise<string | null> {
     try {
-      const git = require('simple-git')();
-      const [message, date] = await Promise.all([
-        git.show([sha, '--format=%s', '--no-patch']),
-        git.show([sha, '--format=%ai', '--no-patch'])
-      ]);
-
-      return {
-        sha,
-        message: message.trim(),
-        date: date.trim(),
-      };
+      const git = simpleGit(this.baseDir);
+      const result = await git.show([sha.trim(), '--format=%H', '--no-patch']);
+      const full = result.trim().split('\n')[0];
+      return /^[a-f0-9]{40}$/i.test(full) ? full : null;
     } catch {
       return null;
+    }
+  }
+
+  private async createIgnoreEntry(sha: string): Promise<IgnoreEntry | null> {
+    try {
+      const fullSha = await this.resolveSha(sha);
+      if (!fullSha) return null;
+
+      const [message, date] = await Promise.all([
+        this.getCommitMessage(fullSha),
+        this.getCommitDate(fullSha),
+      ]);
+
+      return { sha: fullSha, message, date };
+    } catch {
+      return null;
+    }
+  }
+
+  private async getCommitMessage(sha: string): Promise<string> {
+    try {
+      const git = simpleGit(this.baseDir);
+      const result = await git.show([sha, '--format=%s', '--no-patch']);
+      return result.trim();
+    } catch {
+      return 'Unknown';
+    }
+  }
+
+  private async getCommitDate(sha: string): Promise<string> {
+    try {
+      const git = simpleGit(this.baseDir);
+      const result = await git.show([sha, '--format=%ai', '--no-patch']);
+      return result.trim();
+    } catch {
+      return 'Unknown';
     }
   }
 }

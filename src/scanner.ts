@@ -9,68 +9,69 @@ export class BulkCommitScanner {
     whitespaceThreshold: number;
   };
 
-  constructor(config?: {
+  constructor(baseDir?: string, config?: {
     minFilesChanged?: number;
     minBulkScore?: number;
     whitespaceThreshold?: number;
   }) {
-    this.git = simpleGit();
+    this.git = simpleGit(baseDir || process.cwd());
     this.config = {
-      minFilesChanged: config?.minFilesChanged || 20,
-      minBulkScore: config?.minBulkScore || 40,
-      whitespaceThreshold: config?.whitespaceThreshold || 0.8,
+      minFilesChanged: config?.minFilesChanged ?? 20,
+      minBulkScore: config?.minBulkScore ?? 40,
+      whitespaceThreshold: config?.whitespaceThreshold ?? 0.8,
     };
   }
 
-  async scan(): Promise<BulkCommit[]> {
-    try {
-      const log = await this.git.log({ 
-        format: '%H|%s|%ai|%P',
-        file: null,
-        n: 100 
-      });
+  async scan(maxCommits: number = 100): Promise<BulkCommit[]> {
+    const log = await this.git.log({ maxCount: maxCommits });
+    const commits: BulkCommit[] = [];
 
-      const commits: BulkCommit[] = [];
-
-      for (const commit of log.all) {
-        const [hash] = commit.split('|');
-        const bulkCommit = await this.analyzeCommit(hash);
-        if (bulkCommit.bulkScore >= this.config.minBulkScore) {
-          commits.push(bulkCommit);
-        }
+    for (const commit of log.all) {
+      const bulkCommit = await this.analyzeCommit(commit.hash);
+      if (bulkCommit.bulkScore >= this.config.minBulkScore) {
+        commits.push(bulkCommit);
       }
-
-      return commits.sort((a, b) => b.bulkScore - a.bulkScore);
-    } catch (error) {
-      throw new Error(`Failed to scan commits: ${error}`);
     }
+
+    return commits.sort((a, b) => b.bulkScore - a.bulkScore);
   }
 
   private async analyzeCommit(sha: string): Promise<BulkCommit> {
-    const diff = await this.git.diff([`${sha}^`, sha, '--name-only']);
-    const files = diff.split('\n').filter(f => f.trim() !== '');
-    
-    if (files.length < this.config.minFilesChanged) {
-      return this.createEmptyCommit(sha, files.length);
-    }
+    try {
+      const diffSummary = await this.git.diffSummary([`${sha}^`, sha]);
+      const filesChanged = diffSummary.files.length;
 
-    const stats = await this.git.diff([`${sha}^`, sha, '--stat']);
-    const linesChanged = this.parseLinesChanged(stats);
-    
-    const whitespaceRatio = await this.calculateWhitespaceRatio(sha);
-    const message = await this.getCommitMessage(sha);
-    
-    const bulkScore = this.calculateBulkScore(files.length, linesChanged, whitespaceRatio, message);
-    
-    return {
-      sha,
-      message,
-      filesChanged: files.length,
-      linesChanged,
-      whitespaceRatio,
-      bulkScore,
-      date: await this.getCommitDate(sha),
-    };
+      if (filesChanged < this.config.minFilesChanged) {
+        return this.createEmptyCommit(sha, filesChanged);
+      }
+
+      const linesChanged = diffSummary.insertions + diffSummary.deletions;
+      const whitespaceRatio = await this.calculateWhitespaceRatio(sha);
+      const message = await this.getCommitMessage(sha);
+      const date = await this.getCommitDate(sha);
+
+      const bulkScore = this.calculateBulkScore(filesChanged, linesChanged, whitespaceRatio, message);
+
+      return {
+        sha,
+        message,
+        filesChanged,
+        linesChanged,
+        whitespaceRatio,
+        bulkScore,
+        date,
+      };
+    } catch {
+      return {
+        sha,
+        message: 'Unknown',
+        filesChanged: 0,
+        linesChanged: 0,
+        whitespaceRatio: 0,
+        bulkScore: 0,
+        date: 'Unknown',
+      };
+    }
   }
 
   private createEmptyCommit(sha: string, filesChanged: number): BulkCommit {
@@ -85,26 +86,20 @@ export class BulkCommitScanner {
     };
   }
 
-  private parseLinesChanged(stats: string): number {
-    const linesMatch = stats.match(/\d+ files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/);
-    if (!linesMatch) return 0;
-    
-    const insertions = linesMatch[1] ? parseInt(linesMatch[1]) : 0;
-    const deletions = linesMatch[2] ? parseInt(linesMatch[2]) : 0;
-    return insertions + deletions;
-  }
-
   private async calculateWhitespaceRatio(sha: string): Promise<number> {
     try {
       const diff = await this.git.diff([`${sha}^`, sha, '--']);
       if (!diff) return 0;
 
-      const lines = diff.split('\n');
-      const whitespaceLines = lines.filter(line => 
-        line.trim() === '' && line !== 'diff --git' && !line.startsWith('index') && !line.startsWith('---') && !line.startsWith('+++')
-      ).length;
+      const lines = diff.split('\n').filter(line => line.startsWith('+') || line.startsWith('-'));
+      if (lines.length === 0) return 0;
 
-      return lines.length > 0 ? whitespaceLines / lines.length : 0;
+      const whitespaceLines = lines.filter(line => {
+        const content = line.substring(1);
+        return content.trim() === '' || content.trim().length === 0;
+      }).length;
+
+      return whitespaceLines / lines.length;
     } catch {
       return 0;
     }
@@ -129,9 +124,9 @@ export class BulkCommitScanner {
   }
 
   private calculateBulkScore(
-    filesChanged: number, 
-    linesChanged: number, 
-    whitespaceRatio: number, 
+    filesChanged: number,
+    linesChanged: number,
+    whitespaceRatio: number,
     message: string
   ): number {
     let score = 0;
@@ -141,18 +136,31 @@ export class BulkCommitScanner {
     else if (filesChanged >= 30) score += 40;
     else if (filesChanged >= 20) score += 30;
 
-    // Message scoring
+    // Message scoring — detect common bulk-change patterns
     const lowerMessage = message.toLowerCase();
-    if (lowerMessage.includes('prettier') || lowerMessage.includes('format')) score += 20;
-    if (lowerMessage.includes('eslint') || lowerMessage.includes('lint')) score += 20;
-    if (lowerMessage.includes('rename') || lowerMessage.includes('refactor')) score += 20;
+    const bulkKeywords = [
+      { patterns: ['prettier', 'format', 'formatted'], weight: 20 },
+      { patterns: ['eslint', 'lint', 'linting'], weight: 20 },
+      { patterns: ['rename', 'refactor'], weight: 15 },
+      { patterns: ['style', 'indent', 'whitespace', 'trailing'], weight: 15 },
+      { patterns: ['update copyright', 'license', 'header update'], weight: 15 },
+      { patterns: ['mass', 'bulk', 'batch'], weight: 10 },
+    ];
+
+    for (const { patterns, weight } of bulkKeywords) {
+      if (patterns.some(p => lowerMessage.includes(p))) {
+        score += weight;
+        break; // Only count the best match
+      }
+    }
 
     // Whitespace scoring
     if (whitespaceRatio >= this.config.whitespaceThreshold) score += 20;
+    else if (whitespaceRatio >= 0.5) score += 10;
 
-    // Lines per file scoring (if many changes but few lines per file, likely formatting)
+    // Lines per file — low avg suggests formatting
     const linesPerFile = filesChanged > 0 ? linesChanged / filesChanged : 0;
-    if (linesPerFile < 5) score += 10;
+    if (linesPerFile < 5 && filesChanged >= 20) score += 10;
 
     return Math.min(score, 100);
   }
