@@ -52,11 +52,16 @@
     "node": ">=18.0.0"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "exports": {
     ".": "./dist/index.js",
     "./scanner": "./dist/scanner.js",
     "./file-manager": "./dist/file-manager.js"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
